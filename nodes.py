@@ -1544,9 +1544,9 @@ class LoadSpeakerNode:
             },
         }
     
-    # Updated: Added ref_text (STRING) output
-    RETURN_TYPES = ("VOICE_CLONE_PROMPT", "AUDIO", "STRING")
-    RETURN_NAMES = ("voice_clone_prompt", "audio", "ref_text")
+    # Updated: Added role_bank output for instant dialogue use
+    RETURN_TYPES = ("VOICE_CLONE_PROMPT", "AUDIO", "STRING", "QWEN3_ROLE_BANK")
+    RETURN_NAMES = ("voice_clone_prompt", "audio", "ref_text", "role_bank")
     FUNCTION = "load_speaker"
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "LoadSpeaker: Load saved WAV audio and its metadata. Fast-loads .qvp features if available."
@@ -1609,9 +1609,15 @@ class LoadSpeakerNode:
             except Exception as e:
                 print(f"⚠️ [Qwen3-TTS] Failed to fast-load .qvp: {e}")
 
-        # Final Return (including the text)
+        # Create a single-entry role bank for convenience
+        role_bank = {}
+        if prompt_items:
+            role_name = os.path.splitext(filename)[0]
+            role_bank[role_name] = prompt_items
+
+        # Final Return (including the text and bank)
         # Note: If prompt_items is None, the downstream VoiceCloneNode will extract it using its own settings.
-        return (prompt_items, audio_preview, ref_text)
+        return (prompt_items, audio_preview, ref_text, role_bank)
 
 
 class VoiceFusionNode:
@@ -1703,6 +1709,95 @@ class AdvancedVoiceDesignNode:
 
         return (instruct,)
 
+class VoiceLibraryNode:
+    """
+    VoiceLibrary Node: Scan the voices directory and build a Role Bank with all saved voices.
+    This acts as a "Voice Gallery" or "Template Library".
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "refresh": ("BOOLEAN", {"default": False, "tooltip": "Force refresh the internal file list"}),
+            },
+            "optional": {
+                "prefix_filter": ("STRING", {"default": "", "placeholder": "Only include voices starting with..."}),
+            }
+        }
+
+    RETURN_TYPES = ("QWEN3_ROLE_BANK",)
+    RETURN_NAMES = ("role_bank",)
+    FUNCTION = "build_library"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "VoiceLibrary: Automatically creates a Role Bank containing all voices found in models/qwen-tts/voices."
+
+    def build_library(self, refresh: bool = False, prefix_filter: str = "") -> Tuple[Dict[str, Any]]:
+        voices_dir = os.path.join(folder_paths.models_dir, "qwen-tts", "voices")
+        os.makedirs(voices_dir, exist_ok=True)
+
+        bank = {}
+        files = os.listdir(voices_dir)
+
+        # We look for .qvp (features) files
+        for f in files:
+            if f.endswith(".qvp"):
+                role_name = os.path.splitext(f)[0]
+
+                if prefix_filter and not role_name.startswith(prefix_filter):
+                    continue
+
+                qvp_path = os.path.join(voices_dir, f)
+                try:
+                    # Load features
+                    if hasattr(torch, 'serialization') and hasattr(torch.serialization, 'add_safe_globals'):
+                        data = torch.load(qvp_path, map_location="cpu", weights_only=False)
+                    else:
+                        data = torch.load(qvp_path, map_location="cpu")
+
+                    prompt_items = None
+                    if isinstance(data, dict) and "prompt" in data:
+                        prompt_items = data["prompt"]
+                    else:
+                        prompt_items = data
+
+                    if prompt_items:
+                        bank[role_name] = prompt_items
+
+                except Exception as e:
+                    print(f"⚠️ [Qwen3-TTS] Failed to load {f} for library: {e}")
+
+        print(f"📚 [Qwen3-TTS] Voice Library built with {len(bank)} voices.")
+        return (bank,)
+
+class RoleBankMergeNode:
+    """
+    RoleBankMerge Node: Combine two Role Banks into one.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "bank_a": ("QWEN3_ROLE_BANK",),
+                "bank_b": ("QWEN3_ROLE_BANK",),
+            },
+            "optional": {
+                "overwrite": ("BOOLEAN", {"default": True, "tooltip": "If True, bank_b will overwrite bank_a in case of name conflict"}),
+            }
+        }
+
+    RETURN_TYPES = ("QWEN3_ROLE_BANK",)
+    RETURN_NAMES = ("role_bank",)
+    FUNCTION = "merge"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "RoleBankMerge: Merge two voice registries into a single one for Dialogue Inference."
+
+    def merge(self, bank_a, bank_b, overwrite=True):
+        new_bank = bank_a.copy()
+        for k, v in bank_b.items():
+            if overwrite or k not in new_bank:
+                new_bank[k] = v
+        return (new_bank,)
+
 class QwenTTSConfigNode:
     """
     QwenTTSConfig Node: Define global pause durations and settings for other nodes.
@@ -1748,6 +1843,8 @@ NODE_CLASS_MAPPINGS = {
     "QwenTTSConfigNode": QwenTTSConfigNode,
     "VoiceFusionNode": VoiceFusionNode,
     "AdvancedVoiceDesignNode": AdvancedVoiceDesignNode,
+    "VoiceLibraryNode": VoiceLibraryNode,
+    "RoleBankMergeNode": RoleBankMergeNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1762,4 +1859,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "QwenTTSConfigNode": "Qwen3 TTS Config (Pause Control)",
     "VoiceFusionNode": "Qwen3 Voice Fusion (Blend)",
     "AdvancedVoiceDesignNode": "Qwen3 Advanced Voice Lab",
+    "VoiceLibraryNode": "Qwen3 Voice Library (Auto-Scan)",
+    "RoleBankMergeNode": "Qwen3 Role Bank Merge",
 }
