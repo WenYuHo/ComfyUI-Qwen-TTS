@@ -473,6 +473,7 @@ class Qwen3TTSModel:
         language: Union[str, List[str]] = None,
         ref_audio: Optional[Union[AudioLike, List[AudioLike]]] = None,
         ref_text: Optional[Union[str, List[Optional[str]]]] = None,
+        instruct: Optional[Union[str, List[str]]] = None,
         x_vector_only_mode: Union[bool, List[bool]] = False,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[VoiceClonePromptItem]]] = None,
         non_streaming_mode: bool = False,
@@ -588,6 +589,14 @@ class Qwen3TTSModel:
         input_texts = [self._build_assistant_text(t) for t in texts]
         input_ids = self._tokenize_texts(input_texts)
 
+        instructs = self._ensure_list(instruct) if isinstance(instruct, list) else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
+        instruct_ids: List[Optional[torch.Tensor]] = []
+        for ins in instructs:
+            if ins is None or ins == "":
+                instruct_ids.append(None)
+            else:
+                instruct_ids.append(self._tokenize_texts([self._build_instruct_text(ins)])[0])
+
         ref_ids = None
         if ref_texts_for_ids is not None:
             ref_ids = []
@@ -602,6 +611,7 @@ class Qwen3TTSModel:
 
         talker_codes_list, _ = self.model.generate(
             input_ids=input_ids,
+            instruct_ids=instruct_ids,
             ref_ids=ref_ids,
             voice_clone_prompt=voice_clone_prompt_dict,
             languages=languages,
@@ -796,8 +806,9 @@ class Qwen3TTSModel:
         texts = self._ensure_list(text)
         languages = self._ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
         speakers = self._ensure_list(speaker)
-        if self.model.tts_model_size in "0b6": # for 0b6 model, instruct is not supported
-            instruct = None
+        # Fix: Official Qwen3-TTS 0.6B CustomVoice model DOES support instructions
+        # if self.model.tts_model_size in "0b6": # for 0b6 model, instruct is not supported
+        #     instruct = None
         instructs = self._ensure_list(instruct) if isinstance(instruct, list) else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
 
         if len(languages) == 1 and len(texts) > 1:

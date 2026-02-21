@@ -376,18 +376,21 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     # Set precision
     dtype = torch.bfloat16 if precision == "bf16" else torch.float32
     
-    # VoiceDesign restriction
-    if model_type == "VoiceDesign" and model_choice == "0.6B":
-        raise RuntimeError("❌ VoiceDesign only supports 1.7B models!")
+    # VoiceDesign restriction - removed to allow 0.6B fallback
+    # if model_type == "VoiceDesign" and model_choice == "0.6B":
+    #     raise RuntimeError("❌ VoiceDesign only supports 1.7B models!")
         
     # Cache key includes attention implementation and custom model path
     cache_key = (model_type, model_choice, device, precision, attn_impl, custom_model_path)
     if cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
 
-    # Clear old cache only when adding a new model with different config
-    if _MODEL_CACHE:
-        _MODEL_CACHE.clear()
+    # LRU Cache management: keep up to 2 models for hot-swapping
+    if cache_key not in _MODEL_CACHE and len(_MODEL_CACHE) >= 2:
+        oldest_key = next(iter(_MODEL_CACHE))
+        print(f"[Qwen3-TTS] Cache full, unloading oldest model: {oldest_key[0]} {oldest_key[1]}")
+        del _MODEL_CACHE[oldest_key]
+        model_management.soft_empty_cache()
     
     # --- 1. Determine search directories ---
     base_paths = []
@@ -428,6 +431,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         ("Base", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         ("Base", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         ("VoiceDesign", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        ("VoiceDesign", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", # Fallback to CustomVoice 0.6B which supports instructions
         ("CustomVoice", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         ("CustomVoice", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
     }
@@ -577,6 +581,7 @@ class VoiceDesignNode:
             },
             "optional": {
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
+                "num_variants": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1, "tooltip": "Generate multiple variants of the voice"}),
                 "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Nucleus sampling probability"}),
                 "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1, "tooltip": "Top-k sampling parameter"}),
@@ -594,7 +599,7 @@ class VoiceDesignNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "VoiceDesign: Generate custom voices from descriptions."
 
-    def generate(self, text: str, instruct: str, model_choice: str, device: str, precision: str, language: str, seed: int = 0, max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, config: Dict[str, Any] = None) -> Tuple[Dict[str, Any]]:
+    def generate(self, text: str, instruct: str, model_choice: str, device: str, precision: str, language: str, seed: int = 0, num_variants: int = 1, max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, config: Dict[str, Any] = None) -> Tuple[Dict[str, Any]]:
         if not text or not instruct:
             raise RuntimeError("Text and instruction description are required")
 
@@ -611,76 +616,95 @@ class VoiceDesignNode:
 
         model = load_qwen_model("VoiceDesign", model_choice, device, precision, attention, unload_model_after_generate, previous_attention)
 
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        import numpy as np
-        np.random.seed(seed % (2**32))
+        all_variants = []
+        sr = 24000
+
+        for v in range(num_variants):
+            current_seed = (seed + v) & 0xffffffffffffffff
+            torch.manual_seed(current_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(current_seed)
+            np.random.seed(current_seed % (2**32))
+
+            print(f"[Qwen3-TTS] Generating variant {v+1}/{num_variants} with seed {current_seed}...")
+
+            mapped_lang = LANGUAGE_MAP.get(language, "auto")
+
+            # Use helper to split text based on config (if provided)
+            segments = split_text_by_pauses(text, config)
+
+            results = []
+
+            for i, (seg_text, pause_dur) in enumerate(segments):
+                if not seg_text.strip():
+                    # Just pause?
+                    if pause_dur > 0:
+                         silence_len = int(pause_dur * sr)
+                         silence = torch.zeros((1, 1, silence_len))
+                         results.append(silence)
+                    continue
+
+                print(f"[Qwen3-TTS] Generating segment {i+1}/{len(segments)}: '{seg_text[:20]}...'")
+                
+                if model.model.tts_model_type == "voice_design":
+                    wavs, sr = model.generate_voice_design(
+                        text=seg_text,
+                        language=mapped_lang,
+                        instruct=instruct,
+                        max_new_tokens=max_new_tokens,
+                        top_p=top_p,
+                        top_k=top_k,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                    )
+                else:
+                    # Fallback for 0.6B models that use CustomVoice architecture
+                    wavs, sr = model.generate_custom_voice(
+                        text=seg_text,
+                        speaker="ryan", # Default speaker for fallback
+                        language=mapped_lang,
+                        instruct=instruct,
+                        max_new_tokens=max_new_tokens,
+                        top_p=top_p,
+                        top_k=top_k,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                    )
+
+                if isinstance(wavs, list) and len(wavs) > 0:
+                    waveform = torch.from_numpy(wavs[0]).float()
+                    if waveform.ndim == 1:
+                        waveform = waveform.unsqueeze(0).unsqueeze(0) # [1, 1, S]
+                    elif waveform.ndim == 2:
+                        waveform = waveform.unsqueeze(0) # [1, C, S]
+
+                    results.append(waveform)
+
+                if pause_dur > 0:
+                    silence_len = int(pause_dur * sr)
+                    silence = torch.zeros((1, 1, silence_len))
+                    results.append(silence)
+            
+            if results:
+                variant_waveform = torch.cat(results, dim=-1)
+                all_variants.append(variant_waveform)
 
         pbar.update_absolute(2, 3, None)
 
-        mapped_lang = LANGUAGE_MAP.get(language, "auto")
-        
-        # Use helper to split text based on config (if provided)
-        segments = split_text_by_pauses(text, config)
-
-        results = []
-        sr = 24000  # Default Qwen sr, will be overwritten by actual generation
-
-        for i, (seg_text, pause_dur) in enumerate(segments):
-            if not seg_text.strip():
-                # Just pause?
-                if pause_dur > 0:
-                     silence_len = int(pause_dur * sr)
-                     silence = torch.zeros((1, 1, silence_len))
-                     results.append(silence)
-                continue
-
-            print(f"[Qwen3-TTS] Generating segment {i+1}/{len(segments)}: '{seg_text[:20]}...'")
-            
-            wavs, sr = model.generate_voice_design(
-                text=seg_text,
-                language=mapped_lang,
-                instruct=instruct,
-                max_new_tokens=max_new_tokens,
-                top_p=top_p,
-                top_k=top_k,
-                temperature=temperature,
-                repetition_penalty=repetition_penalty,
-            )
-            
-            if isinstance(wavs, list) and len(wavs) > 0:
-                waveform = torch.from_numpy(wavs[0]).float()
-                if waveform.ndim == 1:
-                    waveform = waveform.unsqueeze(0).unsqueeze(0) # [1, 1, S]
-                elif waveform.ndim == 2:
-                    waveform = waveform.unsqueeze(0) # [1, C, S]
-                
-                results.append(waveform)
-            
-            if pause_dur > 0:
-                silence_len = int(pause_dur * sr)
-                silence = torch.zeros((1, 1, silence_len))
-                results.append(silence)
-
         pbar.update_absolute(3, 3, None)
 
-        if results:
-            # Concatenate all
-            max_len = max(w.shape[-1] for w in results) # Wait, shape[-1] is time. We concatenate on time.
-            # Dimensions are [1, 1, S]. All should be [1, 1, S] or compatible.
-            # Assuming mono for simplicity or compatible channels.
+        if all_variants:
+            # For multiple variants, we return a batch (dimension 0)
+            # If they have different lengths, we pad them
+            max_samples = max(v.shape[-1] for v in all_variants)
+            batched_variants = []
+            for v in all_variants:
+                if v.shape[-1] < max_samples:
+                    padding = torch.zeros((v.shape[0], v.shape[1], max_samples - v.shape[-1]))
+                    v = torch.cat([v, padding], dim=-1)
+                batched_variants.append(v)
             
-            # Check channels compatibility
-            target_channels = results[0].shape[1]
-            padded_results = []
-            for w in results:
-                if w.shape[1] != target_channels:
-                    # Fix channels if needed (mean or duplicate)
-                    pass 
-                padded_results.append(w)
-
-            merged_waveform = torch.cat(padded_results, dim=-1)
+            merged_waveform = torch.cat(batched_variants, dim=0) # Batch dimension
             audio_data = {"waveform": merged_waveform, "sample_rate": sr}
 
             if unload_model_after_generate and hasattr(model, '_unload_callback') and model._unload_callback:
@@ -709,6 +733,7 @@ class VoiceCloneNode:
             "optional": {
                 "ref_audio": ("AUDIO", {"tooltip": "Reference audio (ComfyUI Audio)"}),
                 "ref_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Reference audio text (optional)"}),
+                "instruct": ("STRING", {"multiline": True, "default": "", "placeholder": "Style instruction (e.g. 'Speak in a happy tone')"}),
                 "voice_clone_prompt": ("VOICE_CLONE_PROMPT", {"tooltip": "Reusable voice clone prompt from VoiceClonePromptNode"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
                 "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
@@ -813,7 +838,7 @@ class VoiceCloneNode:
         return (waveform, int(sr))
 
     def generate(self, target_text: str, model_choice: str, device: str, precision: str, language: str, 
-                 ref_audio: Optional[Dict[str, Any]] = None, ref_text: str = "", 
+                 ref_audio: Optional[Dict[str, Any]] = None, ref_text: str = "", instruct: str = "",
                  voice_clone_prompt: Optional[Any] = None, seed: int = 0, 
                  max_new_tokens: int = 2048,
                  top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05,
@@ -838,7 +863,6 @@ class VoiceCloneNode:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        import numpy as np
         np.random.seed(seed % (2**32))
         pbar.update_absolute(2, 3, None)
 
@@ -882,6 +906,7 @@ class VoiceCloneNode:
                     language=mapped_lang,
                     ref_audio=ref_audio_param,
                     ref_text=ref_text if ref_text and ref_text.strip() else None,
+                    instruct=instruct if instruct and instruct.strip() else None,
                     voice_clone_prompt=voice_clone_prompt_param,
                     x_vector_only_mode=x_vector_only,
                     max_new_tokens=max_new_tokens,
@@ -999,7 +1024,6 @@ class CustomVoiceNode:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        import numpy as np
         np.random.seed(seed % (2**32))
 
         pbar.update_absolute(2, 3, None)
@@ -1232,7 +1256,6 @@ class DialogueInferenceNode:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        import numpy as np
         np.random.seed(seed % (2**32))
 
         lines = script.strip().split("\n")
@@ -1241,6 +1264,7 @@ class DialogueInferenceNode:
         prompts_to_gen = []
         langs_to_gen = []
         pauses_to_gen = []
+        instructs_to_gen = []
 
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
 
@@ -1264,6 +1288,15 @@ class DialogueInferenceNode:
 
             role_name = role_name.strip()
             text = text.strip()
+
+            # Parse optional instruction/emotion: RoleName [Emotion]: Text
+            line_instruct = ""
+            if "[" in role_name and "]" in role_name:
+                s_idx = role_name.find("[")
+                e_idx = role_name.find("]")
+                if e_idx > s_idx:
+                    line_instruct = role_name[s_idx+1:e_idx].strip()
+                    role_name = role_name[:s_idx].strip()
 
             if role_name not in role_bank:
                 continue
@@ -1302,6 +1335,7 @@ class DialogueInferenceNode:
                 prompts_to_gen.append(current_prompt)
                 langs_to_gen.append(mapped_lang)
                 pauses_to_gen.append(current_segment_pause)
+                instructs_to_gen.append(line_instruct)
 
             if pauses_to_gen:
                 pauses_to_gen[-1] += pause_linebreak
@@ -1325,14 +1359,19 @@ class DialogueInferenceNode:
                 chunk_prompts = prompts_to_gen[i:i + batch_size]
                 chunk_langs = langs_to_gen[i:i + batch_size]
                 chunk_pauses = pauses_to_gen[i:i + batch_size]
+                chunk_instructs = instructs_to_gen[i:i + batch_size]
 
                 current_chunk = i // batch_size + 1
                 print(f"[Qwen3-TTS] Running batched inference for chunk {current_chunk} of {num_chunks}...")
+
+                # Clean instructs list (replace empty with None for the API)
+                api_instructs = [ins if ins and ins.strip() else None for ins in chunk_instructs]
 
                 wavs_list, sr = model.generate_voice_clone(
                     text=chunk_texts,
                     language=chunk_langs,
                     voice_clone_prompt=chunk_prompts,
+                    instruct=api_instructs,
                     max_new_tokens=max_new_tokens_per_line,
                     top_p=top_p,
                     top_k=top_k,
@@ -1501,9 +1540,9 @@ class LoadSpeakerNode:
             },
         }
     
-    # Updated: Added ref_text (STRING) output
-    RETURN_TYPES = ("VOICE_CLONE_PROMPT", "AUDIO", "STRING")
-    RETURN_NAMES = ("voice_clone_prompt", "audio", "ref_text")
+    # Updated: Added role_bank output for instant dialogue use
+    RETURN_TYPES = ("VOICE_CLONE_PROMPT", "AUDIO", "STRING", "QWEN3_ROLE_BANK")
+    RETURN_NAMES = ("voice_clone_prompt", "audio", "ref_text", "role_bank")
     FUNCTION = "load_speaker"
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "LoadSpeaker: Load saved WAV audio and its metadata. Fast-loads .qvp features if available."
@@ -1566,10 +1605,539 @@ class LoadSpeakerNode:
             except Exception as e:
                 print(f"⚠️ [Qwen3-TTS] Failed to fast-load .qvp: {e}")
 
-        # Final Return (including the text)
-        # Note: If prompt_items is None, the downstream VoiceCloneNode will extract it using its own settings.
-        return (prompt_items, audio_preview, ref_text)
+        # Create a single-entry role bank for convenience
+        role_bank = {}
+        if prompt_items:
+            role_name = os.path.splitext(filename)[0]
+            role_bank[role_name] = prompt_items
 
+        # Final Return (including the text and bank)
+        # Note: If prompt_items is None, the downstream VoiceCloneNode will extract it using its own settings.
+        return (prompt_items, audio_preview, ref_text, role_bank)
+
+
+class VoiceFusionNode:
+    """
+    VoiceFusion Node: Blend two voice prompts by interpolating their speaker embeddings.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "prompt_a": ("VOICE_CLONE_PROMPT",),
+                "prompt_b": ("VOICE_CLONE_PROMPT",),
+                "blend_ratio": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "0.0 = Prompt A, 1.0 = Prompt B"}),
+            }
+        }
+
+    RETURN_TYPES = ("VOICE_CLONE_PROMPT",)
+    RETURN_NAMES = ("voice_clone_prompt",)
+    FUNCTION = "fuse"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "VoiceFusion: Blend two voices together by interpolating their speaker characteristics."
+
+    def fuse(self, prompt_a: Any, prompt_b: Any, blend_ratio: float) -> Tuple[Any]:
+        if not prompt_a or not prompt_b:
+            raise RuntimeError("Two valid voice prompts are required for fusion")
+
+        item_a = prompt_a[0] if isinstance(prompt_a, list) else prompt_a
+        item_b = prompt_b[0] if isinstance(prompt_b, list) else prompt_b
+
+        emb_a = item_a.ref_spk_embedding
+        emb_b = item_b.ref_spk_embedding
+
+        # Ensure same device/dtype
+        emb_b = emb_b.to(device=emb_a.device, dtype=emb_a.dtype)
+
+        # Blend embeddings
+        fused_emb = (1.0 - blend_ratio) * emb_a + blend_ratio * emb_b
+
+        # Create new prompt item in force x-vector mode
+        # (Mixed timbre doesn't have a shared prompt text/code)
+        fused_item = VoiceClonePromptItem(
+            ref_code=None,
+            ref_spk_embedding=fused_emb,
+            x_vector_only_mode=True,
+            icl_mode=False,
+            ref_text=None
+        )
+
+        return ([fused_item],)
+
+class AdvancedVoiceDesignNode:
+    """
+    AdvancedVoiceDesign: A structured "Voice Lab" node to construct natural language descriptions.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "gender": (["Female", "Male", "Non-binary"], {"default": "Female"}),
+                "age_group": (["Young", "Middle-aged", "Elderly", "Child"], {"default": "Young"}),
+                "accent": (["Neutral", "American", "British", "Australian", "Southern", "New York", "Indian", "Chinese"], {"default": "Neutral"}),
+                "pitch": (["Very Low", "Low", "Neutral", "High", "Very High"], {"default": "Neutral"}),
+                "style": (["Normal", "Gentle", "Energetic", "Professional", "Whispering", "Authoritative", "Emotional"], {"default": "Normal"}),
+            },
+            "optional": {
+                "custom_instruction": ("STRING", {"multiline": True, "default": "", "placeholder": "Add more details here (e.g., 'breathy voice')"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("instruct",)
+    FUNCTION = "build_instruct"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "AdvancedVoiceDesign: Construct structured style instructions for Voice Design or Cloning."
+
+    def build_instruct(self, gender, age_group, accent, pitch, style, custom_instruction=""):
+        parts = []
+        parts.append(f"A {age_group.lower()} {gender.lower()} speaker")
+        if accent != "Neutral":
+            parts.append(f"with a {accent.lower()} accent")
+        if pitch != "Neutral":
+            parts.append(f"speaking in a {pitch.lower()} pitch")
+        if style != "Normal":
+            parts.append(f"in a {style.lower()} style")
+
+        instruct = ", ".join(parts) + "."
+        if custom_instruction.strip():
+            instruct += " " + custom_instruction.strip()
+
+        return (instruct,)
+
+class VoiceLibraryNode:
+    """
+    VoiceLibrary Node: Scan the voices directory and build a Role Bank with all saved voices.
+    This acts as a "Voice Gallery" or "Template Library".
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "refresh": ("BOOLEAN", {"default": False, "tooltip": "Force refresh the internal file list"}),
+            },
+            "optional": {
+                "prefix_filter": ("STRING", {"default": "", "placeholder": "Only include voices starting with..."}),
+            }
+        }
+
+    RETURN_TYPES = ("QWEN3_ROLE_BANK",)
+    RETURN_NAMES = ("role_bank",)
+    FUNCTION = "build_library"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "VoiceLibrary: Automatically creates a Role Bank containing all voices found in models/qwen-tts/voices."
+
+    def build_library(self, refresh: bool = False, prefix_filter: str = "") -> Tuple[Dict[str, Any]]:
+        voices_dir = os.path.join(folder_paths.models_dir, "qwen-tts", "voices")
+        os.makedirs(voices_dir, exist_ok=True)
+
+        bank = {}
+        files = os.listdir(voices_dir)
+
+        # We look for .qvp (features) files
+        for f in files:
+            if f.endswith(".qvp"):
+                role_name = os.path.splitext(f)[0]
+
+                if prefix_filter and not role_name.startswith(prefix_filter):
+                    continue
+
+                qvp_path = os.path.join(voices_dir, f)
+                try:
+                    # Load features
+                    if hasattr(torch, 'serialization') and hasattr(torch.serialization, 'add_safe_globals'):
+                        data = torch.load(qvp_path, map_location="cpu", weights_only=False)
+                    else:
+                        data = torch.load(qvp_path, map_location="cpu")
+
+                    prompt_items = None
+                    if isinstance(data, dict) and "prompt" in data:
+                        prompt_items = data["prompt"]
+                    else:
+                        prompt_items = data
+
+                    if prompt_items:
+                        bank[role_name] = prompt_items
+
+                except Exception as e:
+                    print(f"⚠️ [Qwen3-TTS] Failed to load {f} for library: {e}")
+
+        print(f"📚 [Qwen3-TTS] Voice Library built with {len(bank)} voices.")
+        return (bank,)
+
+class RoleBankMergeNode:
+    """
+    RoleBankMerge Node: Combine two Role Banks into one.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "bank_a": ("QWEN3_ROLE_BANK",),
+                "bank_b": ("QWEN3_ROLE_BANK",),
+            },
+            "optional": {
+                "overwrite": ("BOOLEAN", {"default": True, "tooltip": "If True, bank_b will overwrite bank_a in case of name conflict"}),
+            }
+        }
+
+    RETURN_TYPES = ("QWEN3_ROLE_BANK",)
+    RETURN_NAMES = ("role_bank",)
+    FUNCTION = "merge"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "RoleBankMerge: Merge two voice registries into a single one for Dialogue Inference."
+
+    def merge(self, bank_a, bank_b, overwrite=True):
+        new_bank = bank_a.copy()
+        for k, v in bank_b.items():
+            if overwrite or k not in new_bank:
+                new_bank[k] = v
+        return (new_bank,)
+
+class MultiVoiceClonePromptNode:
+    """
+    MultiVoiceClonePrompt Node: Average speaker embeddings from multiple clips for a more robust profile.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "audio_1": ("AUDIO",),
+                "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
+                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
+            },
+            "optional": {
+                "audio_2": ("AUDIO",),
+                "audio_3": ("AUDIO",),
+                "audio_4": ("AUDIO",),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("VOICE_CLONE_PROMPT",)
+    RETURN_NAMES = ("voice_clone_prompt",)
+    FUNCTION = "create_prompt"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "MultiVoiceClonePrompt: Extract and average voice features from up to 4 reference audio clips for a more stable and professional clone."
+
+    def create_prompt(self, audio_1, model_choice, device, precision, attention, audio_2=None, audio_3=None, audio_4=None, unload_model_after_generate=False):
+        pbar = ProgressBar(3)
+        model = load_qwen_model("Base", model_choice, device, precision, attention, unload_model_after_generate)
+        pbar.update_absolute(1, 3, None)
+
+        vcn = VoiceCloneNode()
+        audios = [audio_1, audio_2, audio_3, audio_4]
+        embeddings = []
+
+        for i, a in enumerate(audios):
+            if a is not None:
+                waveform, sr = vcn._audio_tensor_to_tuple(a)
+                # Resample if needed
+                if sr != 24000:
+                    import librosa
+                    waveform = librosa.resample(y=waveform, orig_sr=sr, target_sr=24000)
+
+                spk_emb = model.extract_speaker_embedding(audio=waveform, sr=24000)
+                embeddings.append(spk_emb)
+
+        if not embeddings:
+            raise RuntimeError("At least one audio clip is required")
+
+        # Average embeddings
+        mean_emb = torch.stack(embeddings).mean(dim=0)
+
+        # Create new prompt item in force x-vector mode
+        prompt_item = VoiceClonePromptItem(
+            ref_code=None,
+            ref_spk_embedding=mean_emb,
+            x_vector_only_mode=True,
+            icl_mode=False,
+            ref_text=None
+        )
+
+        pbar.update_absolute(3, 3, None)
+        return ([prompt_item],)
+
+class ProsodyControlNode:
+    """
+    ProsodyControl: Generate natural language instructions for speed, pitch, and energy.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "speed": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05}),
+                "pitch": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05}),
+                "energy": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("instruct",)
+    FUNCTION = "build"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "ProsodyControl: Tactile control over speech delivery. Generates natural language instructions for speed, pitch and energy."
+
+    def build(self, speed, pitch, energy):
+        parts = []
+        if speed > 1.3: parts.append("Speak very fast")
+        elif speed > 1.1: parts.append("Speak quickly")
+        elif speed < 0.7: parts.append("Speak very slowly")
+        elif speed < 0.9: parts.append("Speak slowly")
+
+        if pitch > 1.3: parts.append("with a very high pitch")
+        elif pitch > 1.1: parts.append("with a high pitch")
+        elif pitch < 0.7: parts.append("with a very low pitch")
+        elif pitch < 0.9: parts.append("with a low pitch")
+
+        if energy > 1.3: parts.append("with intense energy")
+        elif energy > 1.1: parts.append("energetically")
+        elif energy < 0.7: parts.append("in a very soft whisper")
+        elif energy < 0.9: parts.append("softly and calmly")
+
+        if not parts:
+            return ("Speak in a natural and balanced tone.",)
+
+        return (", ".join(parts) + ".",)
+
+class VoiceGalleryNode:
+    """
+    VoiceGallery: Generate a single audio file containing previews for all voices in a bank.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "role_bank": ("QWEN3_ROLE_BANK",),
+                "preview_text": ("STRING", {"default": "This is a preview of the voice named {name}."}),
+                "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
+                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "precision": (["bf16", "fp32"], {"default": "bf16"}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "generate_gallery"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "VoiceGallery: Automates the generation of standardized previews for every voice in a Role Bank. Great for choosing characters."
+
+    def generate_gallery(self, role_bank, preview_text, model_choice, device, precision):
+        model = load_qwen_model("Base", model_choice, device, precision)
+
+        results = []
+        sr = 24000
+
+        names = sorted(list(role_bank.keys()))
+        for name in names:
+            prompt = role_bank[name]
+            text = preview_text.replace("{name}", name)
+
+            print(f"[Qwen3-TTS] Generating gallery preview for '{name}'...")
+            wavs, sr = model.generate_voice_clone(
+                text=text,
+                language="auto",
+                voice_clone_prompt=prompt,
+                max_new_tokens=1024
+            )
+
+            waveform = torch.from_numpy(wavs[0]).float()
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0).unsqueeze(0)
+            elif waveform.ndim == 2:
+                waveform = waveform.unsqueeze(0)
+
+            results.append(waveform)
+            # Add 1s silence
+            results.append(torch.zeros(1, 1, int(sr)))
+
+        if not results:
+            raise RuntimeError("Role bank is empty")
+
+        merged = torch.cat(results, dim=-1)
+        return ({"waveform": merged, "sample_rate": sr},)
+
+class AutoTranscribeNode:
+    """
+    AutoTranscribe Node: Automatically generate reference text from audio using Whisper.
+    Eliminates manual typing for voice cloning.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "model_size": (["tiny", "base"], {"default": "tiny"}),
+                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "transcribe"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def transcribe(self, audio, model_size, device):
+        if device == "auto":
+            if torch.cuda.is_available(): device = "cuda"
+            elif torch.backends.mps.is_available(): device = "mps"
+            else: device = "cpu"
+
+        from transformers import pipeline
+        model_id = f"openai/whisper-{model_size}"
+        print(f"[Qwen3-TTS] Loading ASR model: {model_id} on {device}...")
+
+        try:
+            # Load ASR pipeline
+            pipe = pipeline("automatic-speech-recognition", model=model_id, device=device)
+
+            # Extract waveform
+            vcn = VoiceCloneNode()
+            waveform, sr = vcn._audio_tensor_to_tuple(audio)
+
+            # ASR expects 16kHz
+            if sr != 16000:
+                import librosa
+                waveform = librosa.resample(y=waveform.astype(np.float32), orig_sr=sr, target_sr=16000)
+
+            result = pipe(waveform)
+            text = result["text"].strip()
+            print(f"[Qwen3-TTS] Transcription successful: '{text[:50]}...'")
+            return (text,)
+        except Exception as e:
+            raise RuntimeError(f"ASR Transcription failed: {e}. Ensure 'transformers' and 'accelerate' are installed.")
+
+class ExpressiveStyleNode:
+    """
+    ExpressiveStyle Node: A library of pre-tuned style instructions for easy one-click delivery control.
+    """
+    STYLE_PRESETS = {
+        "Natural": "Speak in a natural, balanced, and conversational tone.",
+        "ASMR/Whisper": "Speak in a very soft, breathy whisper, very close to the microphone.",
+        "News Anchor": "Speak in a professional, authoritative, and clear broadcast style with perfect articulation.",
+        "Dramatic Storyteller": "Speak in a deep, expressive, and slightly theatrical tone, emphasizing key words.",
+        "Angry/Shouting": "Speak with high intensity, very loudly, and with a sharp, aggressive tone.",
+        "Sad/Emotional": "Speak with a shaky, heavy, and emotional voice as if on the verge of tears.",
+        "Cheerful/Energetic": "Speak in a very bright, upbeat, and fast-paced energetic tone.",
+        "Old/Gravelly": "Speak with a deep, raspy, and aged voice with slow delivery.",
+        "Robot/Monotone": "Speak in a flat, monotone, and emotionless robotic voice.",
+    }
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "style": (list(cls.STYLE_PRESETS.keys()), {"default": "Natural"}),
+            },
+            "optional": {
+                "custom_modifier": ("STRING", {"default": "", "placeholder": "Add extra detail (e.g. 'with a slight laugh')"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("instruct",)
+    FUNCTION = "get_style"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def get_style(self, style, custom_modifier=""):
+        instruct = self.STYLE_PRESETS.get(style, "Speak in a natural tone.")
+        if custom_modifier.strip():
+            instruct = instruct.rstrip(".") + f", {custom_modifier.strip()}."
+        return (instruct,)
+
+class DialogueBuilderNode:
+    """
+    DialogueBuilder Node: A structured helper to build multi-role scripts with emotions.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "role_1": ("STRING", {"default": "Alice"}),
+                "text_1": ("STRING", {"multiline": True, "default": ""}),
+                "role_2": ("STRING", {"default": "Bob"}),
+                "text_2": ("STRING", {"multiline": True, "default": ""}),
+            },
+            "optional": {
+                "emotion_1": ("STRING", {"default": ""}),
+                "emotion_2": ("STRING", {"default": ""}),
+                "role_3": ("STRING", {"default": ""}),
+                "text_3": ("STRING", {"multiline": True, "default": ""}),
+                "emotion_3": ("STRING", {"default": ""}),
+                "role_4": ("STRING", {"default": ""}),
+                "text_4": ("STRING", {"multiline": True, "default": ""}),
+                "emotion_4": ("STRING", {"default": ""}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("script",)
+    FUNCTION = "build"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def build(self, **kwargs):
+        lines = []
+        for i in range(1, 5):
+            role = kwargs.get(f"role_{i}", "").strip()
+            text = kwargs.get(f"text_{i}", "").strip()
+            emotion = kwargs.get(f"emotion_{i}", "").strip()
+
+            if role and text:
+                if emotion:
+                    lines.append(f"{role} [{emotion}]: {text}")
+                else:
+                    lines.append(f"{role}: {text}")
+
+        return ("\n".join(lines),)
+
+class VoiceCloneSmartChunkNode:
+    """
+    VoiceCloneSmartChunk Node: Automatically picks the best (most active) segment for cloning.
+    Ensures high-quality feature extraction from long audio clips.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "target_duration": ("FLOAT", {"default": 10.0, "min": 3.0, "max": 20.0, "step": 1.0}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "process"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def process(self, audio, target_duration):
+        vcn = VoiceCloneNode()
+        waveform, sr = vcn._audio_tensor_to_tuple(audio)
+
+        # Calculate energy over windows to find the most active part
+        hop_size = int(sr * 0.5) # 0.5s hop
+        n_samples = waveform.shape[0]
+        target_samples = int(sr * target_duration)
+
+        if n_samples <= target_samples:
+            return (audio,)
+
+        best_start = 0
+        max_energy = 0
+
+        # Step through the audio and find max energy segment
+        for start in range(0, n_samples - target_samples, hop_size):
+            end = start + target_samples
+            chunk = waveform[start:end]
+            energy = np.sum(chunk**2)
+            if energy > max_energy:
+                max_energy = energy
+                best_start = start
+
+        cropped = waveform[best_start:best_start + target_samples]
+        out_waveform = torch.from_numpy(cropped).unsqueeze(0).unsqueeze(0)
+        return ({"waveform": out_waveform, "sample_rate": sr},)
 
 class QwenTTSConfigNode:
     """
@@ -1614,6 +2182,17 @@ NODE_CLASS_MAPPINGS = {
     "SaveVoiceNode": SaveVoiceNode,
     "LoadSpeakerNode": LoadSpeakerNode,
     "QwenTTSConfigNode": QwenTTSConfigNode,
+    "VoiceFusionNode": VoiceFusionNode,
+    "AdvancedVoiceDesignNode": AdvancedVoiceDesignNode,
+    "VoiceLibraryNode": VoiceLibraryNode,
+    "RoleBankMergeNode": RoleBankMergeNode,
+    "MultiVoiceClonePromptNode": MultiVoiceClonePromptNode,
+    "ProsodyControlNode": ProsodyControlNode,
+    "VoiceGalleryNode": VoiceGalleryNode,
+    "AutoTranscribeNode": AutoTranscribeNode,
+    "ExpressiveStyleNode": ExpressiveStyleNode,
+    "DialogueBuilderNode": DialogueBuilderNode,
+    "VoiceCloneSmartChunkNode": VoiceCloneSmartChunkNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1626,4 +2205,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SaveVoiceNode": "Qwen3 Save Voice",
     "LoadSpeakerNode": "Qwen3 Load Speaker (WAV)",
     "QwenTTSConfigNode": "Qwen3 TTS Config (Pause Control)",
+    "VoiceFusionNode": "Qwen3 Voice Fusion (Blend)",
+    "AdvancedVoiceDesignNode": "Qwen3 Advanced Voice Lab",
+    "VoiceLibraryNode": "Qwen3 Voice Library (Auto-Scan)",
+    "RoleBankMergeNode": "Qwen3 Role Bank Merge",
+    "MultiVoiceClonePromptNode": "Qwen3 Multi-Clip Clone Prompt",
+    "ProsodyControlNode": "Qwen3 Prosody Control (Speed/Pitch)",
+    "VoiceGalleryNode": "Qwen3 Voice Gallery Browser",
+    "AutoTranscribeNode": "Qwen3 Auto-Transcribe (ASR)",
+    "ExpressiveStyleNode": "Qwen3 Expressive Style Presets",
+    "DialogueBuilderNode": "Qwen3 Dialogue Script Builder",
+    "VoiceCloneSmartChunkNode": "Qwen3 Voice Clone Smart Chunk",
 }
