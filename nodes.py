@@ -734,6 +734,7 @@ class VoiceCloneNode:
             "optional": {
                 "ref_audio": ("AUDIO", {"tooltip": "Reference audio (ComfyUI Audio)"}),
                 "ref_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Reference audio text (optional)"}),
+                "instruct": ("STRING", {"multiline": True, "default": "", "placeholder": "Style instruction (e.g. 'Speak in a happy tone')"}),
                 "voice_clone_prompt": ("VOICE_CLONE_PROMPT", {"tooltip": "Reusable voice clone prompt from VoiceClonePromptNode"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
                 "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
@@ -838,7 +839,7 @@ class VoiceCloneNode:
         return (waveform, int(sr))
 
     def generate(self, target_text: str, model_choice: str, device: str, precision: str, language: str, 
-                 ref_audio: Optional[Dict[str, Any]] = None, ref_text: str = "", 
+                 ref_audio: Optional[Dict[str, Any]] = None, ref_text: str = "", instruct: str = "",
                  voice_clone_prompt: Optional[Any] = None, seed: int = 0, 
                  max_new_tokens: int = 2048,
                  top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05,
@@ -907,6 +908,7 @@ class VoiceCloneNode:
                     language=mapped_lang,
                     ref_audio=ref_audio_param,
                     ref_text=ref_text if ref_text and ref_text.strip() else None,
+                    instruct=instruct if instruct and instruct.strip() else None,
                     voice_clone_prompt=voice_clone_prompt_param,
                     x_vector_only_mode=x_vector_only,
                     max_new_tokens=max_new_tokens,
@@ -1266,6 +1268,7 @@ class DialogueInferenceNode:
         prompts_to_gen = []
         langs_to_gen = []
         pauses_to_gen = []
+        instructs_to_gen = []
 
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
 
@@ -1289,6 +1292,15 @@ class DialogueInferenceNode:
 
             role_name = role_name.strip()
             text = text.strip()
+
+            # Parse optional instruction/emotion: RoleName [Emotion]: Text
+            line_instruct = ""
+            if "[" in role_name and "]" in role_name:
+                s_idx = role_name.find("[")
+                e_idx = role_name.find("]")
+                if e_idx > s_idx:
+                    line_instruct = role_name[s_idx+1:e_idx].strip()
+                    role_name = role_name[:s_idx].strip()
 
             if role_name not in role_bank:
                 continue
@@ -1327,6 +1339,7 @@ class DialogueInferenceNode:
                 prompts_to_gen.append(current_prompt)
                 langs_to_gen.append(mapped_lang)
                 pauses_to_gen.append(current_segment_pause)
+                instructs_to_gen.append(line_instruct)
 
             if pauses_to_gen:
                 pauses_to_gen[-1] += pause_linebreak
@@ -1350,14 +1363,19 @@ class DialogueInferenceNode:
                 chunk_prompts = prompts_to_gen[i:i + batch_size]
                 chunk_langs = langs_to_gen[i:i + batch_size]
                 chunk_pauses = pauses_to_gen[i:i + batch_size]
+                chunk_instructs = instructs_to_gen[i:i + batch_size]
 
                 current_chunk = i // batch_size + 1
                 print(f"[Qwen3-TTS] Running batched inference for chunk {current_chunk} of {num_chunks}...")
+
+                # Clean instructs list (replace empty with None for the API)
+                api_instructs = [ins if ins and ins.strip() else None for ins in chunk_instructs]
 
                 wavs_list, sr = model.generate_voice_clone(
                     text=chunk_texts,
                     language=chunk_langs,
                     voice_clone_prompt=chunk_prompts,
+                    instruct=api_instructs,
                     max_new_tokens=max_new_tokens_per_line,
                     top_p=top_p,
                     top_k=top_k,
@@ -1596,6 +1614,95 @@ class LoadSpeakerNode:
         return (prompt_items, audio_preview, ref_text)
 
 
+class VoiceFusionNode:
+    """
+    VoiceFusion Node: Blend two voice prompts by interpolating their speaker embeddings.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "prompt_a": ("VOICE_CLONE_PROMPT",),
+                "prompt_b": ("VOICE_CLONE_PROMPT",),
+                "blend_ratio": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "0.0 = Prompt A, 1.0 = Prompt B"}),
+            }
+        }
+
+    RETURN_TYPES = ("VOICE_CLONE_PROMPT",)
+    RETURN_NAMES = ("voice_clone_prompt",)
+    FUNCTION = "fuse"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "VoiceFusion: Blend two voices together by interpolating their speaker characteristics."
+
+    def fuse(self, prompt_a: Any, prompt_b: Any, blend_ratio: float) -> Tuple[Any]:
+        if not prompt_a or not prompt_b:
+            raise RuntimeError("Two valid voice prompts are required for fusion")
+
+        item_a = prompt_a[0] if isinstance(prompt_a, list) else prompt_a
+        item_b = prompt_b[0] if isinstance(prompt_b, list) else prompt_b
+
+        emb_a = item_a.ref_spk_embedding
+        emb_b = item_b.ref_spk_embedding
+
+        # Ensure same device/dtype
+        emb_b = emb_b.to(device=emb_a.device, dtype=emb_a.dtype)
+
+        # Blend embeddings
+        fused_emb = (1.0 - blend_ratio) * emb_a + blend_ratio * emb_b
+
+        # Create new prompt item in force x-vector mode
+        # (Mixed timbre doesn't have a shared prompt text/code)
+        fused_item = VoiceClonePromptItem(
+            ref_code=None,
+            ref_spk_embedding=fused_emb,
+            x_vector_only_mode=True,
+            icl_mode=False,
+            ref_text=None
+        )
+
+        return ([fused_item],)
+
+class AdvancedVoiceDesignNode:
+    """
+    AdvancedVoiceDesign: A structured "Voice Lab" node to construct natural language descriptions.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "gender": (["Female", "Male", "Non-binary"], {"default": "Female"}),
+                "age_group": (["Young", "Middle-aged", "Elderly", "Child"], {"default": "Young"}),
+                "accent": (["Neutral", "American", "British", "Australian", "Southern", "New York", "Indian", "Chinese"], {"default": "Neutral"}),
+                "pitch": (["Very Low", "Low", "Neutral", "High", "Very High"], {"default": "Neutral"}),
+                "style": (["Normal", "Gentle", "Energetic", "Professional", "Whispering", "Authoritative", "Emotional"], {"default": "Normal"}),
+            },
+            "optional": {
+                "custom_instruction": ("STRING", {"multiline": True, "default": "", "placeholder": "Add more details here (e.g., 'breathy voice')"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("instruct",)
+    FUNCTION = "build_instruct"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "AdvancedVoiceDesign: Construct structured style instructions for Voice Design or Cloning."
+
+    def build_instruct(self, gender, age_group, accent, pitch, style, custom_instruction=""):
+        parts = []
+        parts.append(f"A {age_group.lower()} {gender.lower()} speaker")
+        if accent != "Neutral":
+            parts.append(f"with a {accent.lower()} accent")
+        if pitch != "Neutral":
+            parts.append(f"speaking in a {pitch.lower()} pitch")
+        if style != "Normal":
+            parts.append(f"in a {style.lower()} style")
+
+        instruct = ", ".join(parts) + "."
+        if custom_instruction.strip():
+            instruct += " " + custom_instruction.strip()
+
+        return (instruct,)
+
 class QwenTTSConfigNode:
     """
     QwenTTSConfig Node: Define global pause durations and settings for other nodes.
@@ -1639,6 +1746,8 @@ NODE_CLASS_MAPPINGS = {
     "SaveVoiceNode": SaveVoiceNode,
     "LoadSpeakerNode": LoadSpeakerNode,
     "QwenTTSConfigNode": QwenTTSConfigNode,
+    "VoiceFusionNode": VoiceFusionNode,
+    "AdvancedVoiceDesignNode": AdvancedVoiceDesignNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1651,4 +1760,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SaveVoiceNode": "Qwen3 Save Voice",
     "LoadSpeakerNode": "Qwen3 Load Speaker (WAV)",
     "QwenTTSConfigNode": "Qwen3 TTS Config (Pause Control)",
+    "VoiceFusionNode": "Qwen3 Voice Fusion (Blend)",
+    "AdvancedVoiceDesignNode": "Qwen3 Advanced Voice Lab",
 }
