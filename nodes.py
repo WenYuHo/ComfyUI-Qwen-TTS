@@ -1798,6 +1798,171 @@ class RoleBankMergeNode:
                 new_bank[k] = v
         return (new_bank,)
 
+class MultiVoiceClonePromptNode:
+    """
+    MultiVoiceClonePrompt Node: Average speaker embeddings from multiple clips for a more robust profile.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "audio_1": ("AUDIO",),
+                "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
+                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
+            },
+            "optional": {
+                "audio_2": ("AUDIO",),
+                "audio_3": ("AUDIO",),
+                "audio_4": ("AUDIO",),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("VOICE_CLONE_PROMPT",)
+    RETURN_NAMES = ("voice_clone_prompt",)
+    FUNCTION = "create_prompt"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "MultiVoiceClonePrompt: Extract and average voice features from up to 4 reference audio clips for a more stable and professional clone."
+
+    def create_prompt(self, audio_1, model_choice, device, precision, attention, audio_2=None, audio_3=None, audio_4=None, unload_model_after_generate=False):
+        pbar = ProgressBar(3)
+        model = load_qwen_model("Base", model_choice, device, precision, attention, unload_model_after_generate)
+        pbar.update_absolute(1, 3, None)
+
+        vcn = VoiceCloneNode()
+        audios = [audio_1, audio_2, audio_3, audio_4]
+        embeddings = []
+
+        for i, a in enumerate(audios):
+            if a is not None:
+                waveform, sr = vcn._audio_tensor_to_tuple(a)
+                # Resample if needed
+                if sr != 24000:
+                    import librosa
+                    waveform = librosa.resample(y=waveform, orig_sr=sr, target_sr=24000)
+
+                spk_emb = model.extract_speaker_embedding(audio=waveform, sr=24000)
+                embeddings.append(spk_emb)
+
+        if not embeddings:
+            raise RuntimeError("At least one audio clip is required")
+
+        # Average embeddings
+        mean_emb = torch.stack(embeddings).mean(dim=0)
+
+        # Create new prompt item in force x-vector mode
+        prompt_item = VoiceClonePromptItem(
+            ref_code=None,
+            ref_spk_embedding=mean_emb,
+            x_vector_only_mode=True,
+            icl_mode=False,
+            ref_text=None
+        )
+
+        pbar.update_absolute(3, 3, None)
+        return ([prompt_item],)
+
+class ProsodyControlNode:
+    """
+    ProsodyControl: Generate natural language instructions for speed, pitch, and energy.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "speed": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05}),
+                "pitch": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05}),
+                "energy": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("instruct",)
+    FUNCTION = "build"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "ProsodyControl: Tactile control over speech delivery. Generates natural language instructions for speed, pitch and energy."
+
+    def build(self, speed, pitch, energy):
+        parts = []
+        if speed > 1.3: parts.append("Speak very fast")
+        elif speed > 1.1: parts.append("Speak quickly")
+        elif speed < 0.7: parts.append("Speak very slowly")
+        elif speed < 0.9: parts.append("Speak slowly")
+
+        if pitch > 1.3: parts.append("with a very high pitch")
+        elif pitch > 1.1: parts.append("with a high pitch")
+        elif pitch < 0.7: parts.append("with a very low pitch")
+        elif pitch < 0.9: parts.append("with a low pitch")
+
+        if energy > 1.3: parts.append("with intense energy")
+        elif energy > 1.1: parts.append("energetically")
+        elif energy < 0.7: parts.append("in a very soft whisper")
+        elif energy < 0.9: parts.append("softly and calmly")
+
+        if not parts:
+            return ("Speak in a natural and balanced tone.",)
+
+        return (", ".join(parts) + ".",)
+
+class VoiceGalleryNode:
+    """
+    VoiceGallery: Generate a single audio file containing previews for all voices in a bank.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "role_bank": ("QWEN3_ROLE_BANK",),
+                "preview_text": ("STRING", {"default": "This is a preview of the voice named {name}."}),
+                "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
+                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "precision": (["bf16", "fp32"], {"default": "bf16"}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "generate_gallery"
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "VoiceGallery: Automates the generation of standardized previews for every voice in a Role Bank. Great for choosing characters."
+
+    def generate_gallery(self, role_bank, preview_text, model_choice, device, precision):
+        model = load_qwen_model("Base", model_choice, device, precision)
+
+        results = []
+        sr = 24000
+
+        names = sorted(list(role_bank.keys()))
+        for name in names:
+            prompt = role_bank[name]
+            text = preview_text.replace("{name}", name)
+
+            print(f"[Qwen3-TTS] Generating gallery preview for '{name}'...")
+            wavs, sr = model.generate_voice_clone(
+                text=text,
+                language="auto",
+                voice_clone_prompt=prompt,
+                max_new_tokens=1024
+            )
+
+            waveform = torch.from_numpy(wavs[0]).float()
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0).unsqueeze(0)
+            elif waveform.ndim == 2:
+                waveform = waveform.unsqueeze(0)
+
+            results.append(waveform)
+            # Add 1s silence
+            results.append(torch.zeros(1, 1, int(sr)))
+
+        if not results:
+            raise RuntimeError("Role bank is empty")
+
+        merged = torch.cat(results, dim=-1)
+        return ({"waveform": merged, "sample_rate": sr},)
+
 class QwenTTSConfigNode:
     """
     QwenTTSConfig Node: Define global pause durations and settings for other nodes.
@@ -1845,6 +2010,9 @@ NODE_CLASS_MAPPINGS = {
     "AdvancedVoiceDesignNode": AdvancedVoiceDesignNode,
     "VoiceLibraryNode": VoiceLibraryNode,
     "RoleBankMergeNode": RoleBankMergeNode,
+    "MultiVoiceClonePromptNode": MultiVoiceClonePromptNode,
+    "ProsodyControlNode": ProsodyControlNode,
+    "VoiceGalleryNode": VoiceGalleryNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1861,4 +2029,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AdvancedVoiceDesignNode": "Qwen3 Advanced Voice Lab",
     "VoiceLibraryNode": "Qwen3 Voice Library (Auto-Scan)",
     "RoleBankMergeNode": "Qwen3 Role Bank Merge",
+    "MultiVoiceClonePromptNode": "Qwen3 Multi-Clip Clone Prompt",
+    "ProsodyControlNode": "Qwen3 Prosody Control (Speed/Pitch)",
+    "VoiceGalleryNode": "Qwen3 Voice Gallery Browser",
 }
