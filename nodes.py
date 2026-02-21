@@ -624,7 +624,6 @@ class VoiceDesignNode:
             torch.manual_seed(current_seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(current_seed)
-            import numpy as np
             np.random.seed(current_seed % (2**32))
 
             print(f"[Qwen3-TTS] Generating variant {v+1}/{num_variants} with seed {current_seed}...")
@@ -864,7 +863,6 @@ class VoiceCloneNode:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        import numpy as np
         np.random.seed(seed % (2**32))
         pbar.update_absolute(2, 3, None)
 
@@ -1026,7 +1024,6 @@ class CustomVoiceNode:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        import numpy as np
         np.random.seed(seed % (2**32))
 
         pbar.update_absolute(2, 3, None)
@@ -1259,7 +1256,6 @@ class DialogueInferenceNode:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-        import numpy as np
         np.random.seed(seed % (2**32))
 
         lines = script.strip().split("\n")
@@ -1963,6 +1959,186 @@ class VoiceGalleryNode:
         merged = torch.cat(results, dim=-1)
         return ({"waveform": merged, "sample_rate": sr},)
 
+class AutoTranscribeNode:
+    """
+    AutoTranscribe Node: Automatically generate reference text from audio using Whisper.
+    Eliminates manual typing for voice cloning.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "model_size": (["tiny", "base"], {"default": "tiny"}),
+                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "transcribe"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def transcribe(self, audio, model_size, device):
+        if device == "auto":
+            if torch.cuda.is_available(): device = "cuda"
+            elif torch.backends.mps.is_available(): device = "mps"
+            else: device = "cpu"
+
+        from transformers import pipeline
+        model_id = f"openai/whisper-{model_size}"
+        print(f"[Qwen3-TTS] Loading ASR model: {model_id} on {device}...")
+
+        try:
+            # Load ASR pipeline
+            pipe = pipeline("automatic-speech-recognition", model=model_id, device=device)
+
+            # Extract waveform
+            vcn = VoiceCloneNode()
+            waveform, sr = vcn._audio_tensor_to_tuple(audio)
+
+            # ASR expects 16kHz
+            if sr != 16000:
+                import librosa
+                waveform = librosa.resample(y=waveform.astype(np.float32), orig_sr=sr, target_sr=16000)
+
+            result = pipe(waveform)
+            text = result["text"].strip()
+            print(f"[Qwen3-TTS] Transcription successful: '{text[:50]}...'")
+            return (text,)
+        except Exception as e:
+            raise RuntimeError(f"ASR Transcription failed: {e}. Ensure 'transformers' and 'accelerate' are installed.")
+
+class ExpressiveStyleNode:
+    """
+    ExpressiveStyle Node: A library of pre-tuned style instructions for easy one-click delivery control.
+    """
+    STYLE_PRESETS = {
+        "Natural": "Speak in a natural, balanced, and conversational tone.",
+        "ASMR/Whisper": "Speak in a very soft, breathy whisper, very close to the microphone.",
+        "News Anchor": "Speak in a professional, authoritative, and clear broadcast style with perfect articulation.",
+        "Dramatic Storyteller": "Speak in a deep, expressive, and slightly theatrical tone, emphasizing key words.",
+        "Angry/Shouting": "Speak with high intensity, very loudly, and with a sharp, aggressive tone.",
+        "Sad/Emotional": "Speak with a shaky, heavy, and emotional voice as if on the verge of tears.",
+        "Cheerful/Energetic": "Speak in a very bright, upbeat, and fast-paced energetic tone.",
+        "Old/Gravelly": "Speak with a deep, raspy, and aged voice with slow delivery.",
+        "Robot/Monotone": "Speak in a flat, monotone, and emotionless robotic voice.",
+    }
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "style": (list(cls.STYLE_PRESETS.keys()), {"default": "Natural"}),
+            },
+            "optional": {
+                "custom_modifier": ("STRING", {"default": "", "placeholder": "Add extra detail (e.g. 'with a slight laugh')"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("instruct",)
+    FUNCTION = "get_style"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def get_style(self, style, custom_modifier=""):
+        instruct = self.STYLE_PRESETS.get(style, "Speak in a natural tone.")
+        if custom_modifier.strip():
+            instruct = instruct.rstrip(".") + f", {custom_modifier.strip()}."
+        return (instruct,)
+
+class DialogueBuilderNode:
+    """
+    DialogueBuilder Node: A structured helper to build multi-role scripts with emotions.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "role_1": ("STRING", {"default": "Alice"}),
+                "text_1": ("STRING", {"multiline": True, "default": ""}),
+                "role_2": ("STRING", {"default": "Bob"}),
+                "text_2": ("STRING", {"multiline": True, "default": ""}),
+            },
+            "optional": {
+                "emotion_1": ("STRING", {"default": ""}),
+                "emotion_2": ("STRING", {"default": ""}),
+                "role_3": ("STRING", {"default": ""}),
+                "text_3": ("STRING", {"multiline": True, "default": ""}),
+                "emotion_3": ("STRING", {"default": ""}),
+                "role_4": ("STRING", {"default": ""}),
+                "text_4": ("STRING", {"multiline": True, "default": ""}),
+                "emotion_4": ("STRING", {"default": ""}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("script",)
+    FUNCTION = "build"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def build(self, **kwargs):
+        lines = []
+        for i in range(1, 5):
+            role = kwargs.get(f"role_{i}", "").strip()
+            text = kwargs.get(f"text_{i}", "").strip()
+            emotion = kwargs.get(f"emotion_{i}", "").strip()
+
+            if role and text:
+                if emotion:
+                    lines.append(f"{role} [{emotion}]: {text}")
+                else:
+                    lines.append(f"{role}: {text}")
+
+        return ("\n".join(lines),)
+
+class VoiceCloneSmartChunkNode:
+    """
+    VoiceCloneSmartChunk Node: Automatically picks the best (most active) segment for cloning.
+    Ensures high-quality feature extraction from long audio clips.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "target_duration": ("FLOAT", {"default": 10.0, "min": 3.0, "max": 20.0, "step": 1.0}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "process"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def process(self, audio, target_duration):
+        vcn = VoiceCloneNode()
+        waveform, sr = vcn._audio_tensor_to_tuple(audio)
+
+        # Calculate energy over windows to find the most active part
+        hop_size = int(sr * 0.5) # 0.5s hop
+        n_samples = waveform.shape[0]
+        target_samples = int(sr * target_duration)
+
+        if n_samples <= target_samples:
+            return (audio,)
+
+        best_start = 0
+        max_energy = 0
+
+        # Step through the audio and find max energy segment
+        for start in range(0, n_samples - target_samples, hop_size):
+            end = start + target_samples
+            chunk = waveform[start:end]
+            energy = np.sum(chunk**2)
+            if energy > max_energy:
+                max_energy = energy
+                best_start = start
+
+        cropped = waveform[best_start:best_start + target_samples]
+        out_waveform = torch.from_numpy(cropped).unsqueeze(0).unsqueeze(0)
+        return ({"waveform": out_waveform, "sample_rate": sr},)
+
 class QwenTTSConfigNode:
     """
     QwenTTSConfig Node: Define global pause durations and settings for other nodes.
@@ -2013,6 +2189,10 @@ NODE_CLASS_MAPPINGS = {
     "MultiVoiceClonePromptNode": MultiVoiceClonePromptNode,
     "ProsodyControlNode": ProsodyControlNode,
     "VoiceGalleryNode": VoiceGalleryNode,
+    "AutoTranscribeNode": AutoTranscribeNode,
+    "ExpressiveStyleNode": ExpressiveStyleNode,
+    "DialogueBuilderNode": DialogueBuilderNode,
+    "VoiceCloneSmartChunkNode": VoiceCloneSmartChunkNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2032,4 +2212,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MultiVoiceClonePromptNode": "Qwen3 Multi-Clip Clone Prompt",
     "ProsodyControlNode": "Qwen3 Prosody Control (Speed/Pitch)",
     "VoiceGalleryNode": "Qwen3 Voice Gallery Browser",
+    "AutoTranscribeNode": "Qwen3 Auto-Transcribe (ASR)",
+    "ExpressiveStyleNode": "Qwen3 Expressive Style Presets",
+    "DialogueBuilderNode": "Qwen3 Dialogue Script Builder",
+    "VoiceCloneSmartChunkNode": "Qwen3 Voice Clone Smart Chunk",
 }
