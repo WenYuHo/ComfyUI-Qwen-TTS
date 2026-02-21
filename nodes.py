@@ -376,18 +376,21 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     # Set precision
     dtype = torch.bfloat16 if precision == "bf16" else torch.float32
     
-    # VoiceDesign restriction
-    if model_type == "VoiceDesign" and model_choice == "0.6B":
-        raise RuntimeError("❌ VoiceDesign only supports 1.7B models!")
+    # VoiceDesign restriction - removed to allow 0.6B fallback
+    # if model_type == "VoiceDesign" and model_choice == "0.6B":
+    #     raise RuntimeError("❌ VoiceDesign only supports 1.7B models!")
         
     # Cache key includes attention implementation and custom model path
     cache_key = (model_type, model_choice, device, precision, attn_impl, custom_model_path)
     if cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
 
-    # Clear old cache only when adding a new model with different config
-    if _MODEL_CACHE:
-        _MODEL_CACHE.clear()
+    # LRU Cache management: keep up to 2 models for hot-swapping
+    if cache_key not in _MODEL_CACHE and len(_MODEL_CACHE) >= 2:
+        oldest_key = next(iter(_MODEL_CACHE))
+        print(f"[Qwen3-TTS] Cache full, unloading oldest model: {oldest_key[0]} {oldest_key[1]}")
+        del _MODEL_CACHE[oldest_key]
+        model_management.soft_empty_cache()
     
     # --- 1. Determine search directories ---
     base_paths = []
@@ -428,6 +431,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         ("Base", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         ("Base", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         ("VoiceDesign", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        ("VoiceDesign", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", # Fallback to CustomVoice 0.6B which supports instructions
         ("CustomVoice", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         ("CustomVoice", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
     }
@@ -577,6 +581,7 @@ class VoiceDesignNode:
             },
             "optional": {
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
+                "num_variants": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1, "tooltip": "Generate multiple variants of the voice"}),
                 "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Nucleus sampling probability"}),
                 "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1, "tooltip": "Top-k sampling parameter"}),
@@ -594,7 +599,7 @@ class VoiceDesignNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "VoiceDesign: Generate custom voices from descriptions."
 
-    def generate(self, text: str, instruct: str, model_choice: str, device: str, precision: str, language: str, seed: int = 0, max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, config: Dict[str, Any] = None) -> Tuple[Dict[str, Any]]:
+    def generate(self, text: str, instruct: str, model_choice: str, device: str, precision: str, language: str, seed: int = 0, num_variants: int = 1, max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, config: Dict[str, Any] = None) -> Tuple[Dict[str, Any]]:
         if not text or not instruct:
             raise RuntimeError("Text and instruction description are required")
 
@@ -611,76 +616,96 @@ class VoiceDesignNode:
 
         model = load_qwen_model("VoiceDesign", model_choice, device, precision, attention, unload_model_after_generate, previous_attention)
 
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        import numpy as np
-        np.random.seed(seed % (2**32))
+        all_variants = []
+        sr = 24000
+
+        for v in range(num_variants):
+            current_seed = (seed + v) & 0xffffffffffffffff
+            torch.manual_seed(current_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(current_seed)
+            import numpy as np
+            np.random.seed(current_seed % (2**32))
+
+            print(f"[Qwen3-TTS] Generating variant {v+1}/{num_variants} with seed {current_seed}...")
+
+            mapped_lang = LANGUAGE_MAP.get(language, "auto")
+
+            # Use helper to split text based on config (if provided)
+            segments = split_text_by_pauses(text, config)
+
+            results = []
+
+            for i, (seg_text, pause_dur) in enumerate(segments):
+                if not seg_text.strip():
+                    # Just pause?
+                    if pause_dur > 0:
+                         silence_len = int(pause_dur * sr)
+                         silence = torch.zeros((1, 1, silence_len))
+                         results.append(silence)
+                    continue
+
+                print(f"[Qwen3-TTS] Generating segment {i+1}/{len(segments)}: '{seg_text[:20]}...'")
+                
+                if model.model.tts_model_type == "voice_design":
+                    wavs, sr = model.generate_voice_design(
+                        text=seg_text,
+                        language=mapped_lang,
+                        instruct=instruct,
+                        max_new_tokens=max_new_tokens,
+                        top_p=top_p,
+                        top_k=top_k,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                    )
+                else:
+                    # Fallback for 0.6B models that use CustomVoice architecture
+                    wavs, sr = model.generate_custom_voice(
+                        text=seg_text,
+                        speaker="ryan", # Default speaker for fallback
+                        language=mapped_lang,
+                        instruct=instruct,
+                        max_new_tokens=max_new_tokens,
+                        top_p=top_p,
+                        top_k=top_k,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                    )
+
+                if isinstance(wavs, list) and len(wavs) > 0:
+                    waveform = torch.from_numpy(wavs[0]).float()
+                    if waveform.ndim == 1:
+                        waveform = waveform.unsqueeze(0).unsqueeze(0) # [1, 1, S]
+                    elif waveform.ndim == 2:
+                        waveform = waveform.unsqueeze(0) # [1, C, S]
+
+                    results.append(waveform)
+
+                if pause_dur > 0:
+                    silence_len = int(pause_dur * sr)
+                    silence = torch.zeros((1, 1, silence_len))
+                    results.append(silence)
+            
+            if results:
+                variant_waveform = torch.cat(results, dim=-1)
+                all_variants.append(variant_waveform)
 
         pbar.update_absolute(2, 3, None)
 
-        mapped_lang = LANGUAGE_MAP.get(language, "auto")
-        
-        # Use helper to split text based on config (if provided)
-        segments = split_text_by_pauses(text, config)
-
-        results = []
-        sr = 24000  # Default Qwen sr, will be overwritten by actual generation
-
-        for i, (seg_text, pause_dur) in enumerate(segments):
-            if not seg_text.strip():
-                # Just pause?
-                if pause_dur > 0:
-                     silence_len = int(pause_dur * sr)
-                     silence = torch.zeros((1, 1, silence_len))
-                     results.append(silence)
-                continue
-
-            print(f"[Qwen3-TTS] Generating segment {i+1}/{len(segments)}: '{seg_text[:20]}...'")
-            
-            wavs, sr = model.generate_voice_design(
-                text=seg_text,
-                language=mapped_lang,
-                instruct=instruct,
-                max_new_tokens=max_new_tokens,
-                top_p=top_p,
-                top_k=top_k,
-                temperature=temperature,
-                repetition_penalty=repetition_penalty,
-            )
-            
-            if isinstance(wavs, list) and len(wavs) > 0:
-                waveform = torch.from_numpy(wavs[0]).float()
-                if waveform.ndim == 1:
-                    waveform = waveform.unsqueeze(0).unsqueeze(0) # [1, 1, S]
-                elif waveform.ndim == 2:
-                    waveform = waveform.unsqueeze(0) # [1, C, S]
-                
-                results.append(waveform)
-            
-            if pause_dur > 0:
-                silence_len = int(pause_dur * sr)
-                silence = torch.zeros((1, 1, silence_len))
-                results.append(silence)
-
         pbar.update_absolute(3, 3, None)
 
-        if results:
-            # Concatenate all
-            max_len = max(w.shape[-1] for w in results) # Wait, shape[-1] is time. We concatenate on time.
-            # Dimensions are [1, 1, S]. All should be [1, 1, S] or compatible.
-            # Assuming mono for simplicity or compatible channels.
+        if all_variants:
+            # For multiple variants, we return a batch (dimension 0)
+            # If they have different lengths, we pad them
+            max_samples = max(v.shape[-1] for v in all_variants)
+            batched_variants = []
+            for v in all_variants:
+                if v.shape[-1] < max_samples:
+                    padding = torch.zeros((v.shape[0], v.shape[1], max_samples - v.shape[-1]))
+                    v = torch.cat([v, padding], dim=-1)
+                batched_variants.append(v)
             
-            # Check channels compatibility
-            target_channels = results[0].shape[1]
-            padded_results = []
-            for w in results:
-                if w.shape[1] != target_channels:
-                    # Fix channels if needed (mean or duplicate)
-                    pass 
-                padded_results.append(w)
-
-            merged_waveform = torch.cat(padded_results, dim=-1)
+            merged_waveform = torch.cat(batched_variants, dim=0) # Batch dimension
             audio_data = {"waveform": merged_waveform, "sample_rate": sr}
 
             if unload_model_after_generate and hasattr(model, '_unload_callback') and model._unload_callback:
