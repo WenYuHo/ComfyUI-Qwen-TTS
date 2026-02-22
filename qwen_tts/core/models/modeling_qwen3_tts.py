@@ -54,6 +54,9 @@ from .configuration_qwen3_tts import (
 
 logger = logging.get_logger(__name__)
 
+# Cache for mel basis and window to improve speaker embedding extraction performance
+_MEL_BASIS_CACHE = {}
+
 
 class Res2NetBlock(torch.nn.Module):
     def __init__(self, in_channels, out_channels, scale=8, kernel_size=3, dilation=1):
@@ -394,13 +397,17 @@ def mel_spectrogram(
         print(f"[WARNING] Max value of input waveform signal is {torch.max(y)}")
 
     device = y.device
+    cache_key = (n_fft, num_mels, sampling_rate, fmin, fmax, win_size, device)
 
-    mel = librosa_mel_fn(
-        sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax
-    )
+    if cache_key not in _MEL_BASIS_CACHE:
+        mel = librosa_mel_fn(
+            sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax
+        )
+        mel_basis = torch.from_numpy(mel).float().to(device)
+        hann_window = torch.hann_window(win_size).to(device)
+        _MEL_BASIS_CACHE[cache_key] = (mel_basis, hann_window)
 
-    mel_basis = torch.from_numpy(mel).float().to(device)
-    hann_window = torch.hann_window(win_size).to(device)
+    mel_basis, hann_window = _MEL_BASIS_CACHE[cache_key]
 
     padding = (n_fft - hop_size) // 2
     y = torch.nn.functional.pad(
@@ -1889,8 +1896,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     @torch.inference_mode()
     def extract_speaker_embedding(self, audio, sr):
         assert sr == 24000, "Only support 24kHz audio"
+        # Move waveform to device and ensure float32 before mel_spectrogram to leverage GPU STFT
+        audio_tensor = torch.from_numpy(audio).to(self.device).float().unsqueeze(0)
         mels = mel_spectrogram(
-            torch.from_numpy(audio).unsqueeze(0), 
+            audio_tensor,
             n_fft=1024, 
             num_mels=128, 
             sampling_rate=24000,
@@ -1899,7 +1908,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             fmin=0, 
             fmax=12000
         ).transpose(1, 2)
-        speaker_embedding = self.speaker_encoder(mels.to(self.device).to(self.dtype))[0]
+        # Ensure mels match model dtype for speaker_encoder
+        speaker_embedding = self.speaker_encoder(mels.to(self.dtype))[0]
         return speaker_embedding
     
     @torch.inference_mode()

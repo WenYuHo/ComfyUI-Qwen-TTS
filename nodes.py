@@ -373,9 +373,6 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     else:
         dtype = torch.bfloat16 if precision == "bf16" else torch.float32
     
-    # Set precision
-    dtype = torch.bfloat16 if precision == "bf16" else torch.float32
-    
     # VoiceDesign restriction - removed to allow 0.6B fallback
     # if model_type == "VoiceDesign" and model_choice == "0.6B":
     #     raise RuntimeError("❌ VoiceDesign only supports 1.7B models!")
@@ -877,11 +874,16 @@ class VoiceCloneNode:
             mapped_lang = LANGUAGE_MAP.get(language, "auto")
 
             voice_clone_prompt_param = None
-            ref_audio_param = None
             if voice_clone_prompt is not None:
                 voice_clone_prompt_param = voice_clone_prompt
             elif ref_audio is not None:
-                ref_audio_param = audio_tuple
+                # OPTIMIZATION: Pre-calculate voice clone prompt to avoid redundant processing of ref_audio in the segment loop
+                print(f"[Qwen3-TTS] Pre-calculating voice clone prompt for '{target_text[:30]}...'")
+                voice_clone_prompt_param = model.create_voice_clone_prompt(
+                    ref_audio=audio_tuple,
+                    ref_text=ref_text if ref_text and ref_text.strip() else None,
+                    x_vector_only_mode=x_vector_only
+                )
             else:
                 raise RuntimeError("Either 'ref_audio' or 'voice_clone_prompt' must be provided")
 
@@ -902,11 +904,8 @@ class VoiceCloneNode:
                 wavs_list, sr = model.generate_voice_clone(
                     text=batch_texts,
                     language=mapped_lang,
-                    ref_audio=ref_audio_param,
-                    ref_text=ref_text if ref_text and ref_text.strip() else None,
-                    instruct=instruct if instruct and instruct.strip() else None,
                     voice_clone_prompt=voice_clone_prompt_param,
-                    x_vector_only_mode=x_vector_only,
+                    instruct=instruct if instruct and instruct.strip() else None,
                     max_new_tokens=max_new_tokens,
                     top_p=top_p,
                     top_k=top_k,
