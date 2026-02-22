@@ -893,18 +893,16 @@ class VoiceCloneNode:
             results = []
             sr = 24000  # Default Qwen sr
 
-            for i, (seg_text, pause_dur) in enumerate(segments):
-                if not seg_text.strip():
-                    if pause_dur > 0:
-                        silence_len = int(pause_dur * sr)
-                        silence = torch.zeros((1, 1, silence_len))
-                        results.append(silence)
-                    continue
+            # Optimization: Batch non-empty segments to improve GPU throughput and reduce sequential overhead
+            valid_indices = [idx for idx, (seg_text, _) in enumerate(segments) if seg_text.strip()]
 
-                print(f"[Qwen3-TTS] Generating segment {i+1}/{len(segments)}: '{seg_text[:20]}...'")
+            if valid_indices:
+                batch_texts = [segments[idx][0] for idx in valid_indices]
+                print(f"[Qwen3-TTS] Batch generating {len(batch_texts)} segments...")
 
-                wavs, sr = model.generate_voice_clone(
-                    text=seg_text,
+                # Single call for all segments in the batch
+                wavs_list, sr = model.generate_voice_clone(
+                    text=batch_texts,
                     language=mapped_lang,
                     voice_clone_prompt=voice_clone_prompt_param,
                     instruct=instruct if instruct and instruct.strip() else None,
@@ -914,16 +912,24 @@ class VoiceCloneNode:
                     temperature=temperature,
                     repetition_penalty=repetition_penalty,
                 )
-                
-                if isinstance(wavs, list) and len(wavs) > 0:
-                    waveform = torch.from_numpy(wavs[0]).float()
+                generated_wavs = {idx: wavs_list[j] for j, idx in enumerate(valid_indices)}
+            else:
+                generated_wavs = {}
+
+            # Interleave generated audio and silences in the correct order
+            for i, (seg_text, pause_dur) in enumerate(segments):
+                if i in generated_wavs:
+                    wav = generated_wavs[i]
+                    waveform = torch.from_numpy(wav).float()
                     if waveform.ndim == 1:
                         waveform = waveform.unsqueeze(0).unsqueeze(0)
                     elif waveform.ndim == 2:
                         waveform = waveform.unsqueeze(0)
-                    
                     results.append(waveform)
-                
+                elif not seg_text.strip() and pause_dur == 0:
+                    # Skip truly empty segments with no pause
+                    continue
+
                 if pause_dur > 0:
                     silence_len = int(pause_dur * sr)
                     silence = torch.zeros((1, 1, silence_len))
